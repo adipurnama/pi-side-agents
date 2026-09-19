@@ -6,6 +6,7 @@ import { spawnSync } from "node:child_process";
 import { promises as fs } from "node:fs";
 import os from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
+import { ownsReservation, planSlotSelection, type SlotPolicyResult } from "../src/worktree-slot-policy.js";
 
 const ENV_STATE_ROOT = "PI_SIDE_AGENTS_ROOT";
 const ENV_AGENT_ID = "PI_SIDE_AGENT_ID";
@@ -959,114 +960,141 @@ async function allocateWorktree(options: {
 	const branch = `side-agent/${agentId}`;
 	const mainHead = runOrThrow("git", ["-C", repoRoot, "rev-parse", "HEAD"]).stdout.trim();
 
-	const registry = await loadRegistry(stateRoot);
+	// ── Phase 0: physical facts, no ownership decision ──
+	// Read the worktree reality and the registry once. The ownership check happens under the
+	// allocation lock in phase 1, against a registry read taken inside that lock.
+	const registrySnapshot = await loadRegistry(stateRoot);
 	const slots = await listWorktreeSlots(repoRoot);
-	const registered = listRegisteredWorktrees(repoRoot);
+	const registeredPaths = listRegisteredWorktrees(repoRoot);
 
-	let chosen: WorktreeSlot | undefined;
-	let maxIndex = 0;
-
-	// Build a set of worktree paths claimed by active (non-terminal) agents in the registry,
-	// so we can reject slots even if the lock file was inadvertently cleaned up.
-	const claimedByActiveAgent = new Set<string>();
-	for (const record of Object.values(registry.agents)) {
-		if (record.id !== agentId && record.worktreePath && !isTerminalStatus(record.status)) {
-			claimedByActiveAgent.add(resolve(record.worktreePath));
-		}
-	}
+	const lockedPaths = new Set<string>();
+	const unusablePaths = new Set<string>();
 
 	for (const slot of slots) {
-		maxIndex = Math.max(maxIndex, slot.index);
 		const resolvedSlotPath = resolve(slot.path);
 		const lockPath = join(slot.path, ".pi", "active.lock");
 
-		// Check 1: lock file on disk.
+		// Check 1: lock file on disk. Never select, reset, or clean this slot.
 		if (await fileExists(lockPath)) {
 			const lock = await readJsonFile<Record<string, unknown>>(lockPath);
 			const lockAgentId = typeof lock?.agentId === "string" ? lock.agentId : undefined;
-			if (!lockAgentId || !registry.agents[lockAgentId]) {
+			if (!lockAgentId || !registrySnapshot.agents[lockAgentId]) {
 				warnings.push(`Locked worktree is not tracked in registry: ${slot.path}`);
 			}
+			lockedPaths.add(resolvedSlotPath);
 			continue;
 		}
 
-		// Check 2: registry claims this worktree for an active agent (even if lock is missing).
-		if (claimedByActiveAgent.has(resolvedSlotPath)) {
-			warnings.push(`Worktree claimed by active agent in registry (missing lock): ${slot.path}`);
-			continue;
-		}
-
-		const isRegistered = registered.has(resolve(slot.path));
+		const isRegistered = registeredPaths.has(resolvedSlotPath);
 		if (isRegistered) {
 			const status = run("git", ["-C", slot.path, "status", "--porcelain"]);
 			if (!status.ok) {
 				warnings.push(`Could not inspect unlocked worktree, skipping: ${slot.path}`);
+				unusablePaths.add(resolvedSlotPath);
 				continue;
 			}
 			if (status.stdout.trim().length > 0) {
 				warnings.push(`Unlocked worktree has local changes, skipping: ${slot.path}`);
+				unusablePaths.add(resolvedSlotPath);
 				continue;
 			}
 		} else {
 			const entries = await fs.readdir(slot.path).catch(() => []);
 			if (entries.length > 0) {
 				warnings.push(`Unlocked slot is not a registered worktree and not empty, skipping: ${slot.path}`);
+				unusablePaths.add(resolvedSlotPath);
 				continue;
 			}
 		}
-
-		chosen = slot;
-		break;
 	}
 
-	if (!chosen) {
-		const next = maxIndex + 1 || 1;
-		const parent = dirname(repoRoot);
-		const name = `${basename(repoRoot)}-agent-worktree-${String(next).padStart(4, "0")}`;
-		chosen = { index: next, path: join(parent, name) };
-	}
+	// ── Phase 1: critical section — select and reserve ──
+	// Selection and reservation share one registry transaction. The registry lock is the
+	// allocation lock, so two concurrent agent-start calls cannot choose the same slot. The
+	// reservation is written into the record before the lock is released, which makes it visible
+	// to every other allocator, including slots that do not exist on disk yet.
+	let plan: SlotPolicyResult | undefined;
+	await mutateRegistry(stateRoot, (registry) => {
+		plan = planSlotSelection({
+			repoRoot,
+			agentId,
+			slots,
+			records: Object.values(registry.agents),
+			isTerminal: isTerminalStatus,
+			lockedPaths,
+			unusablePaths,
+			registeredPaths,
+		});
 
-	const chosenPath = chosen.path;
-	const chosenRegistered = registered.has(resolve(chosenPath));
-
-	if (chosenRegistered) {
-		// Remember old branch so we can try to clean it up after switching away.
-		const oldBranch = getCurrentBranch(chosenPath);
-
-		run("git", ["-C", chosenPath, "merge", "--abort"]);
-		runOrThrow("git", ["-C", chosenPath, "reset", "--hard", mainHead]);
-		runOrThrow("git", ["-C", chosenPath, "clean", "-fd"]);
-		runOrThrow("git", ["-C", chosenPath, "checkout", "-B", branch, mainHead]);
-
-		// Best-effort cleanup: delete old branch if fully merged (-d, not -D).
-		if (oldBranch && oldBranch !== branch) {
-			run("git", ["-C", repoRoot, "branch", "-d", oldBranch]);
+		const record = registry.agents[agentId];
+		if (record) {
+			record.worktreePath = plan.slot.path;
+			record.branch = branch;
 		}
-	} else {
-		if (await fileExists(chosenPath)) {
-			const entries = await fs.readdir(chosenPath).catch(() => []);
-			if (entries.length > 0) {
-				throw new Error(`Cannot use worktree slot ${chosenPath}: directory exists and is not empty`);
-			}
-		}
-		await ensureDir(dirname(chosenPath));
-		runOrThrow("git", ["-C", repoRoot, "worktree", "add", "-B", branch, chosenPath, mainHead]);
-	}
-
-	await ensureDir(join(chosenPath, ".pi"));
-	await syncParallelAgentPiFiles(repoRoot, chosenPath);
-	await writeWorktreeLock(chosenPath, {
-		agentId,
-		sessionId: parentSessionId,
-		parentSessionId,
-		pid: process.pid,
-		branch,
-		startedAt: nowIso(),
 	});
+
+	if (!plan) {
+		throw new Error("Worktree allocation failed: no slot was selected");
+	}
+
+	const selected = plan;
+	const chosenPath = selected.slot.path;
+	for (const warning of selected.warnings) {
+		if (!warnings.includes(warning)) warnings.push(warning);
+	}
+
+	// ── Phase 2: prepare the reserved slot, outside the lock ──
+	try {
+		if (selected.isRegistered) {
+			// Remember old branch so we can try to clean it up after switching away.
+			const oldBranch = getCurrentBranch(chosenPath);
+
+			run("git", ["-C", chosenPath, "merge", "--abort"]);
+			runOrThrow("git", ["-C", chosenPath, "reset", "--hard", mainHead]);
+			runOrThrow("git", ["-C", chosenPath, "clean", "-fd"]);
+			runOrThrow("git", ["-C", chosenPath, "checkout", "-B", branch, mainHead]);
+
+			// Best-effort cleanup: delete old branch if fully merged (-d, not -D).
+			if (oldBranch && oldBranch !== branch) {
+				run("git", ["-C", repoRoot, "branch", "-d", oldBranch]);
+			}
+		} else {
+			if (await fileExists(chosenPath)) {
+				const entries = await fs.readdir(chosenPath).catch(() => []);
+				if (entries.length > 0) {
+					throw new Error(`Cannot use worktree slot ${chosenPath}: directory exists and is not empty`);
+				}
+			}
+			await ensureDir(dirname(chosenPath));
+			runOrThrow("git", ["-C", repoRoot, "worktree", "add", "-B", branch, chosenPath, mainHead]);
+		}
+
+		await ensureDir(join(chosenPath, ".pi"));
+		await syncParallelAgentPiFiles(repoRoot, chosenPath);
+		await writeWorktreeLock(chosenPath, {
+			agentId,
+			sessionId: parentSessionId,
+			parentSessionId,
+			pid: process.pid,
+			branch,
+			startedAt: nowIso(),
+		});
+	} catch (err) {
+		// Release only this start's reservation, and only when this record still owns this path.
+		// Another start's reservation is never touched, and no other slot is reset or cleaned.
+		await mutateRegistry(stateRoot, (registry) => {
+			const record = registry.agents[agentId];
+			if (ownsReservation(record, agentId, chosenPath)) {
+				delete record.worktreePath;
+				delete record.branch;
+			}
+		});
+		throw err;
+	}
 
 	return {
 		worktreePath: chosenPath,
-		slotIndex: chosen.index,
+		slotIndex: selected.slot.index,
 		branch,
 		warnings,
 	};
