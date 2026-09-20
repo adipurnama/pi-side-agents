@@ -19,6 +19,8 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { join, resolve as resolvePath } from "node:path";
 import { tmpdir } from "node:os";
 
+import { CONTEXT_BOUNDARY_RULE } from "../../src/context-boundary-rule.js";
+
 // ---------------------------------------------------------------------------
 // Minimal JS re-implementations of pure extension functions
 // (kept in sync with extensions/side-agents.ts by contract)
@@ -949,36 +951,51 @@ test("agent-send '/' prefix is forwarded verbatim (no special parse)", () => {
  * This helper covers the "suffix applied" paths; the no-messages early-return
  * is a separate code path that returns the raw task.
  */
-function buildSimpleKickoffPrompt(task, parentSession) {
-	const sessionSuffix = parentSession ? `\n\nParent Pi session: ${parentSession}` : "";
-	return task + sessionSuffix;
+function buildSimpleKickoffPrompt(task) {
+	return task + CONTEXT_BOUNDARY_RULE;
 }
 
-test("kickoff prompt — appends parent session path when available", () => {
-	const result = buildSimpleKickoffPrompt("Fix the bug", "/home/user/.pi/agent/sessions/abc123/session.jsonl");
+test("kickoff prompt — task comes first", () => {
+	const result = buildSimpleKickoffPrompt("Fix the bug");
 	assert.ok(result.startsWith("Fix the bug"), "task must come first");
-	assert.ok(result.includes("Parent Pi session: /home/user/.pi/agent/sessions/abc123/session.jsonl"),
-		"must include parent session path");
 });
 
-test("kickoff prompt — no suffix when parent session is undefined", () => {
-	const result = buildSimpleKickoffPrompt("Fix the bug", undefined);
-	assert.strictEqual(result, "Fix the bug", "should be raw task without suffix");
+test("kickoff prompt — REGRESSION: never leaks a parent session transcript path", () => {
+	const result = buildSimpleKickoffPrompt("Fix the bug");
+	assert.ok(!result.includes("Parent Pi session"), "must not name a parent session");
+	assert.ok(!result.includes(".jsonl"), "must not contain a session transcript path");
+	assert.ok(!result.includes("/sessions/"), "must not contain a session directory path");
 });
 
-test("kickoff prompt — no suffix when parent session is empty string", () => {
-	const result = buildSimpleKickoffPrompt("Fix the bug", "");
-	assert.strictEqual(result, "Fix the bug", "empty session should produce no suffix");
+test("kickoff prompt — states the permitted inputs", () => {
+	const result = buildSimpleKickoffPrompt("Fix the bug");
+	assert.ok(result.includes("## Context boundary"), "must state the boundary");
+	assert.ok(result.includes("Repo Contract"), "must list the applicable Repo Contract");
+	// Without this clause a child refused a control-plane-issued continuation packet as a forbidden
+	// .pi/side-agents/ path, so a transport fix defeated the boundary fix.
+	assert.ok(
+		result.includes("A file the control plane names in a message is part of that handoff"),
+		"must permit a control-plane-named handoff file",
+	);
 });
 
-test("kickoff prompt — suffix is separated by blank line from task", () => {
-	const result = buildSimpleKickoffPrompt("Do something", "/tmp/session.jsonl");
-	const lines = result.split("\n");
-	// task, blank, blank (from \n\n), then "Parent Pi session: ..."
-	assert.ok(lines.length >= 3, `expected at least 3 lines, got ${lines.length}`);
+test("kickoff prompt — forbids orchestration state and transcripts", () => {
+	const result = buildSimpleKickoffPrompt("Fix the bug");
+	assert.ok(result.includes(".pi/side-agents/"), "must forbid orchestration state under .pi");
+	assert.ok(result.includes("orchestration log"), "must forbid orchestration logs");
+});
+
+test("kickoff prompt — directs the child to NEEDS_INPUT instead of scraping", () => {
+	const result = buildSimpleKickoffPrompt("Fix the bug");
+	assert.ok(result.includes("NEEDS_INPUT"), "must name NEEDS_INPUT as the fallback");
+	assert.ok(result.includes("Never rebuild a lost"), "must forbid rebuilding a lost decision");
+});
+
+test("kickoff prompt — boundary rule is separated from the task by a blank line", () => {
+	const lines = buildSimpleKickoffPrompt("Do something").split("\n");
 	assert.strictEqual(lines[0], "Do something");
 	assert.strictEqual(lines[1], "", "first separator line should be empty");
-	assert.ok(lines[2].startsWith("Parent Pi session:"), "third line should be the session ref");
+	assert.strictEqual(lines[2], "## Context boundary");
 });
 
 // ---------------------------------------------------------------------------
