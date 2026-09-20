@@ -8,6 +8,8 @@ import { promises as fs } from "node:fs";
 import os from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 
+import { CONTEXT_BOUNDARY_RULE } from "../src/context-boundary-rule.js";
+
 const ENV_STATE_ROOT = "PI_SIDE_AGENTS_ROOT";
 const ENV_AGENT_ID = "PI_SIDE_AGENT_ID";
 const ENV_PARENT_SESSION = "PI_SIDE_PARENT_SESSION";
@@ -1301,10 +1303,8 @@ async function allocateWorktree(options: {
 }
 
 async function buildKickoffPrompt(ctx: ExtensionContext, task: string, includeSummary: boolean): Promise<{ prompt: string; warning?: string }> {
-	const parentSession = ctx.sessionManager.getSessionFile();
-	const sessionSuffix = parentSession ? `\n\nParent Pi session: ${parentSession}` : "";
 	if (!includeSummary || !ctx.model) {
-		return { prompt: task + sessionSuffix };
+		return { prompt: task + CONTEXT_BOUNDARY_RULE };
 	}
 
 	const branch = ctx.sessionManager.getBranch();
@@ -1313,7 +1313,7 @@ async function buildKickoffPrompt(ctx: ExtensionContext, task: string, includeSu
 		.map((entry) => entry.message);
 
 	if (messages.length === 0) {
-		return { prompt: task };
+		return { prompt: task + CONTEXT_BOUNDARY_RULE };
 	}
 
 	try {
@@ -1346,23 +1346,15 @@ async function buildKickoffPrompt(ctx: ExtensionContext, task: string, includeSu
 		);
 
 		if (!summary) {
-			return { prompt: task + sessionSuffix };
+			return { prompt: task + CONTEXT_BOUNDARY_RULE };
 		}
 
-		const prompt = [
-			task,
-			"",
-			"## Parent session",
-			parentSession ? `- ${parentSession}` : "- (unknown)",
-			"",
-			"## Relevant parent context",
-			summary,
-		].join("\n");
+		const prompt = [task, "", "## Relevant parent context", summary, CONTEXT_BOUNDARY_RULE].join("\n");
 
 		return { prompt };
 	} catch (err) {
 		return {
-			prompt: task + sessionSuffix,
+			prompt: task + CONTEXT_BOUNDARY_RULE,
 			warning: `Failed to generate context summary: ${stringifyError(err)}. Started child with raw task only.`,
 		};
 	}
