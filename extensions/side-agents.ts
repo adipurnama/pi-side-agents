@@ -9,6 +9,7 @@ import os from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 
 import { CONTEXT_BOUNDARY_RULE } from "../src/context-boundary-rule.js";
+import { planSlotSelection, type SlotPolicyResult } from "../src/worktree-slot-policy.js";
 
 const ENV_STATE_ROOT = "PI_SIDE_AGENTS_ROOT";
 const ENV_AGENT_ID = "PI_SIDE_AGENT_ID";
@@ -1181,9 +1182,10 @@ async function allocateWorktree(options: {
 		}
 	}
 
+	const lockedPaths = new Set<string>();
+	const unusablePaths = new Set<string>();
+
 	for (const slot of slots) {
-		maxIndex = Math.max(maxIndex, slot.index);
-		if (chosen) continue;
 		const resolvedSlotPath = resolve(slot.path);
 		const lockPath = join(slot.path, ".pi", "active.lock");
 
@@ -1194,48 +1196,77 @@ async function allocateWorktree(options: {
 			if (!lockAgentId || !registry.agents[lockAgentId]) {
 				warnings.push(`Locked worktree is not tracked in registry: ${slot.path}`);
 			}
+			lockedPaths.add(resolvedSlotPath);
 			continue;
 		}
 
-		// Check 2: registry claims this worktree for an active agent (even if lock is missing).
-		if (claimedByActiveAgent.has(resolvedSlotPath)) {
-			warnings.push(`Worktree claimed by active agent in registry (missing lock): ${slot.path}`);
-			continue;
-		}
-
-		// Check 3: a live nested agent still has to merge into this worktree.
+		// Check 2: a live nested agent still has to merge into this worktree.
 		if (pinnedAsParentCheckout.has(resolvedSlotPath)) {
 			warnings.push(`Worktree is the merge target of a live nested agent, skipping: ${slot.path}`);
+			unusablePaths.add(resolvedSlotPath);
 			continue;
 		}
 
-		const isRegistered = registered.has(resolve(slot.path));
+		const isRegistered = registered.has(resolvedSlotPath);
 		if (isRegistered) {
 			const status = run("git", ["-C", slot.path, "status", "--porcelain"]);
 			if (!status.ok) {
 				warnings.push(`Could not inspect unlocked worktree, skipping: ${slot.path}`);
+				unusablePaths.add(resolvedSlotPath);
 				continue;
 			}
 			if (status.stdout.trim().length > 0) {
 				warnings.push(`Unlocked worktree has local changes, skipping: ${slot.path}`);
+				unusablePaths.add(resolvedSlotPath);
 				continue;
 			}
 		} else {
 			const entries = await fs.readdir(slot.path).catch(() => []);
 			if (entries.length > 0) {
 				warnings.push(`Unlocked slot is not a registered worktree and not empty, skipping: ${slot.path}`);
+				unusablePaths.add(resolvedSlotPath);
 				continue;
 			}
 		}
-
-		chosen = slot;
 	}
 
-	if (!chosen) {
-		const next = maxIndex + 1 || 1;
-		const parent = dirname(repoRoot);
-		const name = `${basename(repoRoot)}-agent-worktree-${String(next).padStart(4, "0")}`;
-		chosen = { index: next, path: join(parent, name) };
+	let plan: SlotPolicyResult | undefined;
+	await mutateRegistry(stateRoot, (registry) => {
+		if (resumeInPlace && chosen) {
+			const record = registry.agents[agentId];
+			if (record) {
+				record.worktreePath = chosen.path;
+				record.branch = branch;
+			}
+			return;
+		}
+
+		plan = planSlotSelection({
+			repoRoot,
+			agentId,
+			slots,
+			records: Object.values(registry.agents),
+			isTerminal: isTerminalStatus,
+			lockedPaths,
+			unusablePaths,
+			registeredPaths: registered,
+		});
+
+		const record = registry.agents[agentId];
+		if (record) {
+			record.worktreePath = plan.slot.path;
+			record.branch = branch;
+		}
+	});
+
+	if (!resumeInPlace) {
+		if (!plan) {
+			throw new Error("Worktree allocation failed: no slot was selected");
+		}
+		chosen = plan.slot;
+		for (const warning of plan.warnings) {
+			if (!warnings.includes(warning)) warnings.push(warning);
+		}
 	}
 
 	const chosenPath = chosen.path;
@@ -2681,6 +2712,13 @@ async function sendToAgent(stateRoot: string, agentId: string, prompt: string): 
 		}
 	}
 	if (payload.length > 0) {
+		if (payload.includes("\n")) {
+			// Multi-line prompt: write to temp file to prevent tmux newline fragmenting / TUI editor stranding.
+			// Matches the standard ticket-execution and side-agent policy.
+			const tmpFile = join(os.tmpdir(), `side-agent-prompt-${normalizedId}-${Date.now()}.md`);
+			await fs.writeFile(tmpFile, payload, "utf8");
+			payload = `Read ${tmpFile} and follow it exactly.`;
+		}
 		tmuxSendPrompt(record.tmuxWindowId, payload);
 	}
 
