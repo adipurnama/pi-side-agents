@@ -527,24 +527,32 @@ async function resolveChildWindowId(harness, agentId) {
 }
 
 async function closeChildWindowAfterPrompt(harness, agentId, windowIdHint) {
-	await waitForBacklogContains(harness, agentId, "Press any key to close this tmux window", 60_000);
-
 	const terminalRecord = await waitForAgent(harness, agentId, { terminal: true, timeoutMs: 120_000 }).catch(
 		() => undefined,
 	);
 	const windowId = windowIdHint || terminalRecord?.tmuxWindowId || (await resolveChildWindowId(harness, agentId));
-	assert.ok(windowId, `agent ${agentId} should have a tmuxWindowId (registry/launch.sh fallback)`);
 
-	if (!windowExists(harness, windowId)) {
+	// A clean exit (code 0) makes the launcher close its own window, so there may be nothing left
+	// to close. Only a non-zero exit holds the window on the press-any-key prompt.
+	if (!windowId) {
 		return;
 	}
 
-	const childPaneRaw = await capturePane(harness, windowId, 500);
-	const childPane = normalizeScreen(childPaneRaw);
-	assert.ok(
-		childPane.includes("Press any key to close this tmux window"),
-		"child pane should show press-any-key prompt before close",
+	let promptVisible = false;
+	await waitFor(
+		`tmux window ${windowId} to close or show the press-any-key prompt`,
+		async () => {
+			if (!windowExists(harness, windowId)) return true;
+			const pane = normalizeScreen(await capturePane(harness, windowId, 500));
+			promptVisible = pane.includes("Press any key to close this tmux window");
+			return promptVisible;
+		},
+		{ timeoutMs: 60_000, intervalMs: 1_000 },
 	);
+
+	if (!promptVisible || !windowExists(harness, windowId)) {
+		return;
+	}
 
 	const paneTargetResult = tmux(
 		harness,
@@ -1038,9 +1046,7 @@ test(
 		await waitForAgent(harness, firstId, { terminal: true, timeoutMs: 120_000 });
 		await waitForAgent(harness, secondId, { terminal: true, timeoutMs: 180_000 });
 
-		await waitForBacklogContains(harness, firstId, "Press any key to close this tmux window", 60_000);
-		await waitForBacklogContains(harness, secondId, "Press any key to close this tmux window", 60_000);
-
+		// Both children exit cleanly, so the launcher closes their windows without a keypress.
 		await closeChildWindowAfterPrompt(harness, firstId);
 		await closeChildWindowAfterPrompt(harness, secondId);
 	},

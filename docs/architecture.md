@@ -182,9 +182,10 @@ This is how child worktrees discover:
 - A new window is created in the **current tmux session**, named `agent-<agentId>`.
 - The tmux pane is piped into `backlog.log`.
 - The window runs the generated `launch.sh`.
-- On Pi exit, the launcher writes `exit.json`, prompts:
-  - `Press any key to close this tmux window…`
-  and then kills the tmux window.
+- On Pi exit, the launcher writes `exit.json`.
+- A clean exit (code `0`) closes the tmux window by itself.
+- A non-zero exit holds the window open on
+  `Press any key to close this tmux window…`, and then kills the tmux window.
 
 ### 6.3 Child environment variables
 

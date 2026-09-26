@@ -1505,13 +1505,16 @@ set -e
 write_exit "$exit_code"
 
 if [[ "$exit_code" -eq 0 ]]; then
+  # A clean exit means the agent did its work, so the window closes by itself instead of
+  # holding the session on a keypress. Give tmux pipe-pane a moment to flush the final lines
+  # into backlog.log, which the controller reads for the report, before the window goes away.
   echo "[side-agent] Agent finished."
+  sleep 1
 else
   echo "[side-agent] Agent exited with code $exit_code."
+  read -n 1 -s -r -p "[side-agent] Press any key to close this tmux window..." || true
+  echo
 fi
-
-read -n 1 -s -r -p "[side-agent] Press any key to close this tmux window..." || true
-echo
 
 tmux kill-window -t "$WINDOW_ID" || true
 `;
